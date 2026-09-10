@@ -12,6 +12,9 @@
     "reload": {
       "service": "mdi:reload"
     },
+    "suspend": {
+      "service": "mdi:clock-outline"
+    },
     "toggle": {
       "service": "mdi:robot"
     },

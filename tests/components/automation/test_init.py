@@ -24,6 +24,7 @@ from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_NAME,
     CONF_ID,
+    EVENT_HOMEASSISTANT_STARTED,
     SERVICE_RELOAD,
     SERVICE_TOGGLE,
     SERVICE_TURN_OFF,
@@ -4403,6 +4404,831 @@ async def test_automation_records_not_triggered_trace(
         "reason": "mock_reason",
         "data": {"x": 1},
     }
+
+
+async def test_automation_suspend_and_resume(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test suspending an automation and having it resume after timer fires."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    assert automation.is_on(hass, "automation.hello")
+
+    # Suspend for 1 hour
+    now = dt_util.utcnow()
+    suspend_time = now + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # Automation should now be off (disabled) and have suspended_until attribute
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time.isoformat()
+
+    # Triggering the event while suspended should not call the action
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+    assert len(calls) == 0
+
+    # Fast forward time past the suspend time
+    async_fire_time_changed(hass, suspend_time + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    # Automation should now be on (enabled) and suspended_until should be gone
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+    # Triggering now should execute the action
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+
+
+async def test_automation_suspend_manual_enable_clears_timer(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test enabling a suspended automation clears the suspend timer and attribute."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    suspend_time = dt_util.utcnow() + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # Manually turn on
+    await hass.services.async_call(
+        automation.DOMAIN,
+        SERVICE_TURN_ON,
+        {"entity_id": "automation.hello"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+    # Unsuspend automation should be removed
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "hello_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is None
+
+    # Fast forward time to when timer would have expired; ensure no extra toggle or issues
+    async_fire_time_changed(hass, suspend_time + timedelta(seconds=1))
+    await hass.async_block_till_done()
+    assert automation.is_on(hass, "automation.hello")
+
+
+async def test_automation_suspend_manual_turn_off_clears_unsuspend_automation(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test manually turning off a suspended automation clears suspended_until and removes unsuspend automation."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    suspend_time = dt_util.utcnow() + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # Unsuspend automation should exist
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "hello_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is not None
+
+    # Manually turn off
+    await hass.services.async_call(
+        automation.DOMAIN,
+        SERVICE_TURN_OFF,
+        {"entity_id": "automation.hello"},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert "suspended_until" not in state.attributes
+
+    # Unsuspend automation should be removed
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "hello_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is None
+
+
+async def test_automation_suspend_ha_start_trigger_before_until(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test unsuspend one-shot automation HA start trigger when start occurs before until."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "id": "test_ha_start",
+                "alias": "Test HA Start",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    suspend_time = dt_util.utcnow() + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.test_ha_start",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # Verify unsuspend automation exists with id test_ha_start_unsuspend
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "test_ha_start_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is not None
+    assert unsuspend_entity.extra_state_attributes.get("mode") == "one-shot"
+
+    # Fire HA started event while time has NOT reached suspend_time
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await hass.async_block_till_done()
+
+    # Automation should still be off, condition failed
+    state = hass.states.get("automation.test_ha_start")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert "suspended_until" in state.attributes
+
+    # Unsuspend automation should still exist
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "test_ha_start_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is not None
+
+    # Advance time past suspend_time: time trigger fires and enables automation
+    async_fire_time_changed(hass, suspend_time + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.test_ha_start")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+    # Unsuspend automation should be deleted (one-shot completed)
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "test_ha_start_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is None
+
+
+async def test_automation_suspend_ha_start_after_until(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test unsuspend one-shot automation HA start trigger when start occurs after until."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "id": "test_ha_start_2",
+                "alias": "Test HA Start 2",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    suspend_time = dt_util.utcnow() + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.test_ha_start_2",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # Verify unsuspend automation exists
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "test_ha_start_2_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is not None
+
+    # Fire HA started event after suspend_time has passed
+    later = suspend_time + timedelta(minutes=5)
+    with (
+        patch("homeassistant.util.dt.utcnow", return_value=later),
+        patch("homeassistant.util.dt.now", return_value=dt_util.as_local(later)),
+    ):
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+
+    # Automation should now be on, condition passed
+    state = hass.states.get("automation.test_ha_start_2")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+    # Unsuspend automation should be deleted (one-shot completed)
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "test_ha_start_2_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is None
+
+
+async def test_automation_suspend_manually_editing_unsuspend_automation_updates_state(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test editing the unsuspend one-shot automation updates base automation suspended_until."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    now = dt_util.utcnow()
+    suspend_time_1 = now + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time_1.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.attributes.get("suspended_until") == suspend_time_1.isoformat()
+
+    # Find the unsuspend automation and simulate manually editing its variables and condition
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "hello_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is not None
+
+    suspend_time_2 = now + timedelta(hours=3)
+    assert unsuspend_entity.raw_config is not None
+    unsuspend_entity.raw_config["variables"]["suspended_until"] = (
+        suspend_time_2.isoformat()
+    )
+    unsuspend_entity.raw_config["conditions"] = [
+        {
+            "condition": "template",
+            "value_template": f"{{{{ now() >= as_datetime('{suspend_time_2.isoformat()}') }}}}",
+        }
+    ]
+
+    # Writing base entity state dynamically reflects the new time
+    base_entity = hass.data[automation.DOMAIN].get_entity("automation.hello")
+    assert base_entity is not None
+    base_entity.async_write_ha_state()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.attributes.get("suspended_until") == suspend_time_2.isoformat()
+
+
+async def test_automation_suspend_manually_deleting_unsuspend_automation_clears_state(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test manually deleting the unsuspend automation clears the base automation's suspended_until."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    suspend_time = dt_util.utcnow() + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.attributes.get("suspended_until") == suspend_time.isoformat()
+
+    # Manually delete the unsuspend automation
+    await automation.async_delete_automation(hass, automation_id="hello_unsuspend")
+    await hass.async_block_till_done()
+
+    # Base automation should still be off, but suspended_until should be gone
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert "suspended_until" not in state.attributes
+
+
+async def test_automation_suspend_deleted_from_yaml_clears_state_on_restore(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test that if unsuspend automation was deleted from automations.yaml while offline, it is not restored."""
+    # Write automations.yaml with base automation but without hello_unsuspend
+    config_path = hass.config.path(automation.AUTOMATION_CONFIG_PATH)
+    await hass.async_add_executor_job(
+        automation._write_config, config_path, [{"id": "hello", "alias": "hello"}]
+    )
+
+    try:
+        suspend_time = dt_util.utcnow() + timedelta(hours=2)
+        mock_restore_cache(
+            hass,
+            (
+                State(
+                    "automation.hello",
+                    STATE_OFF,
+                    {"suspended_until": suspend_time.isoformat()},
+                ),
+            ),
+        )
+
+        assert await async_setup_component(
+            hass,
+            automation.DOMAIN,
+            {
+                automation.DOMAIN: {
+                    "id": "hello",
+                    "alias": "hello",
+                    "trigger": {"platform": "event", "event_type": "test_event"},
+                    "action": {"action": "test.automation", "entity_id": "hello.world"},
+                }
+            },
+        )
+        await hass.async_block_till_done()
+
+        state = hass.states.get("automation.hello")
+        assert state is not None
+        # Because hello_unsuspend was not in automations.yaml, it was not recreated, and suspended_until is cleared
+        assert "suspended_until" not in state.attributes
+    finally:
+        Path(config_path).unlink(missing_ok=True)
+
+
+async def test_automation_suspend_multiday(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test multi-day long suspension works with time trigger and condition."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    now = dt_util.utcnow()
+    suspend_time = now + timedelta(days=3)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time.isoformat()
+
+    # Advance time by 1 day: time trigger fires, but condition fails (not yet time)
+    async_fire_time_changed(hass, now + timedelta(days=1, seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time.isoformat()
+
+    # Advance time by 2 days: time trigger fires, but condition fails (not yet time)
+    async_fire_time_changed(hass, now + timedelta(days=2, seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time.isoformat()
+
+    # Advance time to suspend_time + 1s (day 3): condition passes and automation resumes
+    async_fire_time_changed(hass, suspend_time + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+    # Unsuspend automation should be removed
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "hello_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is None
+
+
+async def test_automation_resuspend_ignores_stale_timer_callback(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test re-suspending an automation ignores stale timer callbacks from previous suspension."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    now = dt_util.utcnow()
+    suspend_time_1 = now + timedelta(hours=1)
+    suspend_time_2 = now + timedelta(hours=2)
+
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time_1.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    # Re-suspend to a later time
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time_2.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time_2.isoformat()
+
+    # The unsuspend automation should exist and have id f"{base_id}_unsuspend"
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "hello_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is not None
+
+    # Automation must still be off and still suspended until suspend_time_2
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time_2.isoformat()
+
+    # Advance time past suspend_time_1: should remain off
+    async_fire_time_changed(hass, suspend_time_1 + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time_2.isoformat()
+
+    # Advance time past suspend_time_2: should now be re-enabled
+    async_fire_time_changed(hass, suspend_time_2 + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+    # Unsuspend automation should be removed
+    unsuspend_entity = next(
+        (
+            e
+            for e in hass.data[automation.DATA_COMPONENT].entities
+            if e.unique_id == "hello_unsuspend"
+        ),
+        None,
+    )
+    assert unsuspend_entity is None
+
+
+async def test_automation_suspend_with_none_resumes(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test calling suspend with no 'until' or until=None resumes the automation."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    suspend_time = dt_util.utcnow() + timedelta(hours=1)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+            "until": suspend_time.isoformat(),
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert not automation.is_on(hass, "automation.hello")
+
+    # Call suspend without until (or until=None)
+    await hass.services.async_call(
+        automation.DOMAIN,
+        "suspend",
+        {
+            "entity_id": "automation.hello",
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+
+async def test_automation_restore_suspended_future(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test state restore when suspended_until is in the future."""
+    suspend_time = dt_util.utcnow() + timedelta(hours=2)
+    mock_restore_cache(
+        hass,
+        (
+            State(
+                "automation.hello",
+                STATE_OFF,
+                {"suspended_until": suspend_time.isoformat()},
+            ),
+        ),
+    )
+
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time.isoformat()
+
+    # Advance time past suspend_time
+    async_fire_time_changed(hass, suspend_time + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+
+async def test_automation_restore_suspended_past(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test state restore when suspended_until has already passed."""
+    suspend_time = dt_util.utcnow() - timedelta(minutes=10)
+    mock_restore_cache(
+        hass,
+        (
+            State(
+                "automation.hello",
+                STATE_OFF,
+                {"suspended_until": suspend_time.isoformat()},
+            ),
+        ),
+    )
+
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+
+async def test_automation_restore_suspended_future_with_initial_state_on(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """Test that active future suspension takes precedence over initial_state: on."""
+    suspend_time = dt_util.utcnow() + timedelta(hours=2)
+    mock_restore_cache(
+        hass,
+        (
+            State(
+                "automation.hello",
+                STATE_OFF,
+                {"suspended_until": suspend_time.isoformat()},
+            ),
+        ),
+    )
+
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "initial_state": "on",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation", "entity_id": "hello.world"},
+            }
+        },
+    )
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_OFF
+    assert state.attributes.get("suspended_until") == suspend_time.isoformat()
+
+    # Triggering the event while suspended should not trigger the action
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+    assert len(calls) == 0
+
+    # Advance time past suspend_time
+    async_fire_time_changed(hass, suspend_time + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    state = hass.states.get("automation.hello")
+    assert state is not None
+    assert state.state == STATE_ON
+    assert "suspended_until" not in state.attributes
+
+    # Now that it has resumed, triggering should work
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+    assert len(calls) == 1
 
 
 async def test_not_triggered_traces_counted_separately(

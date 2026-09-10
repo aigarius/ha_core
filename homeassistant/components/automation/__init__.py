@@ -4,8 +4,10 @@ from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 import logging
 import os
+import re
 from typing import Any, cast, override
 
 import probatio
@@ -28,6 +30,7 @@ from homeassistant.const import (  # noqa: F401
     CONF_MODE,
     CONF_PATH,
     CONF_TRIGGERS,
+    CONF_UNTIL,
     CONF_VARIABLES,
     SERVICE_RELOAD,
     SERVICE_TOGGLE,
@@ -85,12 +88,13 @@ from homeassistant.helpers.trace import (
     trace_path,
 )
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import dt as dt_util
 from homeassistant.util.dt import parse_datetime
 from homeassistant.util.file import write_utf8_file_atomic
 from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.yaml import dump, load_yaml
 
-from .config import AutomationConfig, ValidationStatus
+from .config import AutomationConfig, ValidationStatus, _async_validate_config_item
 from .const import (
     CONF_INITIAL_STATE,
     CONF_TRACE,
@@ -136,6 +140,26 @@ def _delete_from_config(path: str, automation_id: str) -> bool:
     return True
 
 
+def _save_to_config(path: str, automation_config: dict[str, Any]) -> None:
+    """Save or update automation in config file if file exists."""
+    if not os.path.isfile(path):
+        return
+    data = _read_config(path)
+    index = next(
+        (
+            idx
+            for idx, val in enumerate(data)
+            if val.get(CONF_ID) == automation_config[CONF_ID]
+        ),
+        None,
+    )
+    if index is not None:
+        data[index] = automation_config
+    else:
+        data.append(automation_config)
+    _write_config(path, data)
+
+
 async def async_delete_automation(
     hass: HomeAssistant, automation_id: str | None, entity_id: str | None = None
 ) -> bool:
@@ -174,6 +198,7 @@ ATTR_LAST_TRIGGERED = "last_triggered"
 ATTR_SOURCE = "source"
 ATTR_VARIABLES = "variables"
 SERVICE_TRIGGER = "trigger"
+SERVICE_SUSPEND = "suspend"
 
 
 class IfAction(condition_helper.ConditionsChecker):
@@ -351,6 +376,11 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         },
         "async_turn_off",
     )
+    component.async_register_entity_service(
+        SERVICE_SUSPEND,
+        {probatio.Optional(CONF_UNTIL, default=None): probatio.Any(cv.datetime, None)},
+        "async_suspend",
+    )
 
     async def reload_service_handler(service_call: ServiceCall) -> None:
         """Remove all automations and load new ones from config."""
@@ -442,6 +472,10 @@ class BaseAutomationEntity(ToggleEntity, ABC):
         skip_condition: bool = False,
     ) -> ScriptRunResult | None:
         """Trigger automation."""
+
+    @abstractmethod
+    async def async_suspend(self, until: Any = None) -> None:
+        """Suspend the automation until a specific datetime or resume if None."""
 
 
 class UnavailableAutomationEntity(BaseAutomationEntity):
@@ -540,6 +574,10 @@ class UnavailableAutomationEntity(BaseAutomationEntity):
     ) -> None:
         """Trigger automation."""
 
+    @override
+    async def async_suspend(self, until: Any = None) -> None:
+        """Suspend the automation until a specific datetime or resume if None."""
+
 
 class AutomationEntity(BaseAutomationEntity, RestoreEntity):
     """Entity to show status of entity."""
@@ -579,6 +617,93 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         self._attr_unique_id = automation_id
         self._mode = mode
 
+    def _get_base_id(self) -> str:
+        """Return the base ID for this automation entity."""
+        if self.unique_id:
+            return self.unique_id
+        if self.raw_config and self.raw_config.get(CONF_ID):
+            return str(self.raw_config[CONF_ID])
+        return split_entity_id(self.entity_id)[1]
+
+    def _get_unsuspend_entity(self) -> BaseAutomationEntity | None:
+        """Find the unsuspend automation entity for this automation."""
+        if (self.unique_id and self.unique_id.endswith("_unsuspend")) or (
+            self.entity_id and split_entity_id(self.entity_id)[1].endswith("_unsuspend")
+        ):
+            return None
+        unsuspend_id = f"{self._get_base_id()}_unsuspend"
+        component: EntityComponent[BaseAutomationEntity] | None = self.hass.data.get(
+            DATA_COMPONENT
+        )
+        if not component:
+            return None
+        for entity in component.entities:
+            if (
+                isinstance(entity, BaseAutomationEntity)
+                and entity.unique_id == unsuspend_id
+            ):
+                return entity
+        return None
+
+    def _get_base_entity(self) -> BaseAutomationEntity | None:
+        """Find the base automation entity if this is an unsuspend automation."""
+        if not self.unique_id or not self.unique_id.endswith("_unsuspend"):
+            return None
+        base_id = self.unique_id.removesuffix("_unsuspend")
+        component: EntityComponent[BaseAutomationEntity] | None = self.hass.data.get(
+            DATA_COMPONENT
+        )
+        if not component:
+            return None
+        for entity in component.entities:
+            if isinstance(entity, BaseAutomationEntity):
+                if base_id in (
+                    entity.unique_id,
+                    split_entity_id(entity.entity_id)[1],
+                ):
+                    return entity
+        return None
+
+    def _extract_suspended_until(
+        self, unsuspend_entity: BaseAutomationEntity
+    ) -> datetime | None:
+        """Extract suspended_until datetime from unsuspend automation config."""
+        if not unsuspend_entity.raw_config:
+            return None
+
+        # First check variables.suspended_until
+        if variables := unsuspend_entity.raw_config.get(CONF_VARIABLES):
+            if isinstance(variables, dict) and (
+                until_str := variables.get("suspended_until")
+            ):
+                if until_dt := parse_datetime(str(until_str)):
+                    return dt_util.as_utc(until_dt)
+
+        # Next check condition template as fallback if user edited condition directly
+        if conditions := unsuspend_entity.raw_config.get(CONF_CONDITIONS):
+            for cond in conditions:
+                if isinstance(cond, dict) and (val_tpl := cond.get("value_template")):
+                    if match := re.search(
+                        r"as_datetime\(['\"]([^'\"]+)['\"]\)", str(val_tpl)
+                    ):
+                        if until_dt := parse_datetime(match.group(1)):
+                            return dt_util.as_utc(until_dt)
+
+        return None
+
+    @property
+    def suspended_until(self) -> datetime | None:
+        """Return the suspended_until datetime derived from the unsuspend automation."""
+        if (self.unique_id and self.unique_id.endswith("_unsuspend")) or (
+            self.entity_id and split_entity_id(self.entity_id)[1].endswith("_unsuspend")
+        ):
+            return None
+
+        if (unsuspend_entity := self._get_unsuspend_entity()) is not None:
+            return self._extract_suspended_until(unsuspend_entity)
+
+        return None
+
     @property
     @override
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -590,6 +715,10 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
             AutomationEntityStateAttribute.MODE: self._mode,
             AutomationEntityStateAttribute.CUR: self.action_script.runs,
         }
+        if (suspended_until := self.suspended_until) is not None:
+            attrs[AutomationEntityStateAttribute.SUSPENDED_UNTIL] = (
+                suspended_until.isoformat()
+            )
         if self.action_script.supports_max:
             attrs[AutomationEntityStateAttribute.MAX] = self.action_script.max_runs
         return attrs
@@ -695,6 +824,7 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         )
         self.action_script.update_logger(self._logger)
 
+        restored_suspended_until: datetime | None = None
         if state := await self.async_get_last_state():
             enable_automation = state.state == STATE_ON
             last_triggered = state.attributes.get(
@@ -702,6 +832,16 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
             )
             if last_triggered is not None:
                 self.action_script.last_triggered = parse_datetime(last_triggered)
+            if suspended_until_str := state.attributes.get(
+                AutomationEntityStateAttribute.SUSPENDED_UNTIL
+            ):
+                if (suspended_until := parse_datetime(suspended_until_str)) is not None:
+                    utc_suspended_until = dt_util.as_utc(suspended_until)
+                    if utc_suspended_until > dt_util.utcnow():
+                        restored_suspended_until = utc_suspended_until
+                        enable_automation = False
+                    else:
+                        enable_automation = True
             self._logger.debug(
                 "Loaded automation %s with state %s from state storage last state %s",
                 self.entity_id,
@@ -717,25 +857,188 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
             )
 
         if self._initial_state is not None:
-            enable_automation = self._initial_state
-            self._logger.debug(
-                "Automation %s initial state %s overridden from config initial_state",
-                self.entity_id,
-                enable_automation,
-            )
+            if restored_suspended_until is not None:
+                self._logger.debug(
+                    "Automation %s initial_state %s ignored because it is suspended until %s",
+                    self.entity_id,
+                    self._initial_state,
+                    restored_suspended_until,
+                )
+            else:
+                enable_automation = self._initial_state
+                self._logger.debug(
+                    "Automation %s initial state %s overridden from config initial_state",
+                    self.entity_id,
+                    enable_automation,
+                )
 
         if enable_automation:
             await self._async_enable()
 
+        if restored_suspended_until is not None:
+            await self._async_ensure_unsuspend_automation(restored_suspended_until)
+
+        if self.unique_id and self.unique_id.endswith("_unsuspend"):
+            if base_entity := self._get_base_entity():
+                base_entity.async_write_ha_state()
+
+    async def _async_create_unsuspend_automation(self, until: datetime) -> None:
+        """Create a one-shot automation to unsuspend this automation."""
+        if (self.unique_id and self.unique_id.endswith("_unsuspend")) or (
+            self.entity_id and split_entity_id(self.entity_id)[1].endswith("_unsuspend")
+        ):
+            return
+
+        unsuspend_id = f"{self._get_base_id()}_unsuspend"
+
+        # Remove existing unsuspend automation if any
+        await self._async_remove_unsuspend_automation()
+
+        utc_until = dt_util.as_utc(until)
+        local_until = dt_util.as_local(utc_until)
+
+        raw_config: dict[str, Any] = {
+            CONF_ID: unsuspend_id,
+            CONF_ALIAS: f"Unsuspend {self.name}",
+            CONF_MODE: SCRIPT_MODE_ONE_SHOT,
+            CONF_VARIABLES: {
+                "suspended_until": utc_until.isoformat(),
+            },
+            CONF_TRIGGERS: [
+                {"trigger": "time", "at": local_until.strftime("%H:%M:%S")},
+                {"trigger": "homeassistant", "event": "start"},
+            ],
+            CONF_CONDITIONS: [
+                {
+                    "condition": "template",
+                    "value_template": (
+                        f"{{{{ (trigger.now if trigger is defined and trigger.now is defined else now())"
+                        f" >= as_datetime('{utc_until.isoformat()}') }}}}"
+                    ),
+                }
+            ],
+            CONF_ACTIONS: [
+                {
+                    "action": "automation.turn_on",
+                    "target": {"entity_id": self.entity_id},
+                }
+            ],
+        }
+
+        try:
+            validated_config = await _async_validate_config_item(
+                self.hass, raw_config, raise_on_errors=True, warn_on_errors=False
+            )
+        except (probatio.Invalid, HomeAssistantError) as err:
+            self._logger.error(
+                "Failed to validate unsuspend automation config: %s", err
+            )
+            return
+
+        automation_config = AutomationEntityConfig(
+            config_block=validated_config,
+            list_no=0,
+            raw_blueprint_inputs=None,
+            raw_config=raw_config,
+            validation_error=None,
+            validation_status=ValidationStatus.OK,
+        )
+
+        entities = await _create_automation_entities(self.hass, [automation_config])
+        if component := self.hass.data.get(DATA_COMPONENT):
+            await component.async_add_entities(entities)
+
+        path = self.hass.config.path(AUTOMATION_CONFIG_PATH)
+        await self.hass.async_add_executor_job(_save_to_config, path, raw_config)
+
+    async def _async_remove_unsuspend_automation(self) -> None:
+        """Remove the unsuspend one-shot automation if it exists and is not currently running."""
+        if (self.unique_id and self.unique_id.endswith("_unsuspend")) or (
+            self.entity_id and split_entity_id(self.entity_id)[1].endswith("_unsuspend")
+        ):
+            return
+
+        unsuspend_id = f"{self._get_base_id()}_unsuspend"
+
+        component: EntityComponent[BaseAutomationEntity] | None = self.hass.data.get(
+            DATA_COMPONENT
+        )
+        if component:
+            unsuspend_entity = next(
+                (e for e in component.entities if e.unique_id == unsuspend_id),
+                None,
+            )
+            if (
+                unsuspend_entity is not None
+                and isinstance(unsuspend_entity, BaseAutomationEntity)
+                and (
+                    hasattr(unsuspend_entity, "action_script")
+                    and unsuspend_entity.action_script.is_running
+                )
+            ):
+                return
+
+        await async_delete_automation(self.hass, automation_id=unsuspend_id)
+
+    async def _async_ensure_unsuspend_automation(self, until: datetime) -> None:
+        """Ensure the unsuspend one-shot automation exists for the given until time."""
+        if (self.unique_id and self.unique_id.endswith("_unsuspend")) or (
+            self.entity_id and split_entity_id(self.entity_id)[1].endswith("_unsuspend")
+        ):
+            return
+
+        unsuspend_id = f"{self._get_base_id()}_unsuspend"
+
+        component: EntityComponent[BaseAutomationEntity] | None = self.hass.data.get(
+            DATA_COMPONENT
+        )
+        if component:
+            existing = next(
+                (e for e in component.entities if e.unique_id == unsuspend_id),
+                None,
+            )
+            if existing is not None:
+                return
+
+        path = self.hass.config.path(AUTOMATION_CONFIG_PATH)
+        if os.path.isfile(path):
+            data = await self.hass.async_add_executor_job(_read_config, path)
+            base_in_yaml = any(val.get(CONF_ID) == self._get_base_id() for val in data)
+            if base_in_yaml and not any(
+                val.get(CONF_ID) == unsuspend_id for val in data
+            ):
+                # Base automation is in automations.yaml, but unsuspend automation was deleted from it
+                return
+
+        await self._async_create_unsuspend_automation(until)
+
+    @override
+    async def async_suspend(self, until: datetime | None = None) -> None:
+        """Suspend the automation until a specific datetime or resume if None."""
+        if until is not None:
+            utc_until = dt_util.as_utc(until)
+            if utc_until > dt_util.utcnow():
+                await self._async_create_unsuspend_automation(utc_until)
+                await self._async_disable()
+                self.async_write_ha_state()
+                return
+
+        # If until is None or in the past, re-enable and remove unsuspend automation
+        await self._async_remove_unsuspend_automation()
+        await self._async_enable()
+        self.async_write_ha_state()
+
     @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on and update the state."""
+        await self._async_remove_unsuspend_automation()
         await self._async_enable()
         self.async_write_ha_state()
 
     @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
+        await self._async_remove_unsuspend_automation()
         if CONF_STOP_ACTIONS in kwargs:
             await self._async_disable(kwargs[CONF_STOP_ACTIONS])
         else:
@@ -906,6 +1209,10 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
     @override
     async def async_will_remove_from_hass(self) -> None:
         """Remove listeners when removing automation from Home Assistant."""
+        await self._async_remove_unsuspend_automation()
+        if self.unique_id and self.unique_id.endswith("_unsuspend"):
+            if base_entity := self._get_base_entity():
+                base_entity.async_write_ha_state()
         await super().async_will_remove_from_hass()
         if self.registry_entry and self.registry_entry.entity_id != self.entity_id:
             # Entity ID change, do not unload the script or conditions as they will
