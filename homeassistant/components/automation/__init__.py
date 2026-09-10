@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
 import logging
 from typing import Any, cast, override
 
@@ -26,6 +28,7 @@ from homeassistant.const import (  # noqa: F401
     CONF_MODE,
     CONF_PATH,
     CONF_TRIGGERS,
+    CONF_UNTIL,
     CONF_VARIABLES,
     SERVICE_RELOAD,
     SERVICE_TOGGLE,
@@ -51,6 +54,7 @@ from homeassistant.helpers import (
 )
 from homeassistant.helpers.entity import ToggleEntity
 from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.issue_registry import (
     IssueSeverity,
     async_create_issue,
@@ -79,6 +83,7 @@ from homeassistant.helpers.trace import (
     trace_path,
 )
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import dt as dt_util
 from homeassistant.util.dt import parse_datetime
 from homeassistant.util.hass_dict import HassKey
 
@@ -111,6 +116,7 @@ ATTR_LAST_TRIGGERED = "last_triggered"
 ATTR_SOURCE = "source"
 ATTR_VARIABLES = "variables"
 SERVICE_TRIGGER = "trigger"
+SERVICE_SUSPEND = "suspend"
 
 
 class IfAction(condition_helper.ConditionsChecker):
@@ -284,6 +290,11 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         {vol.Optional(CONF_STOP_ACTIONS, default=DEFAULT_STOP_ACTIONS): cv.boolean},
         "async_turn_off",
     )
+    component.async_register_entity_service(
+        SERVICE_SUSPEND,
+        {vol.Optional(CONF_UNTIL, default=None): vol.Any(cv.datetime, None)},
+        "async_suspend",
+    )
 
     async def reload_service_handler(service_call: ServiceCall) -> None:
         """Remove all automations and load new ones from config."""
@@ -375,6 +386,10 @@ class BaseAutomationEntity(ToggleEntity, ABC):
         skip_condition: bool = False,
     ) -> ScriptRunResult | None:
         """Trigger automation."""
+
+    @abstractmethod
+    async def async_suspend(self, until: Any = None) -> None:
+        """Suspend the automation until a specific datetime or resume if None."""
 
 
 class UnavailableAutomationEntity(BaseAutomationEntity):
@@ -473,6 +488,10 @@ class UnavailableAutomationEntity(BaseAutomationEntity):
     ) -> None:
         """Trigger automation."""
 
+    @override
+    async def async_suspend(self, until: Any = None) -> None:
+        """Suspend the automation until a specific datetime or resume if None."""
+
 
 class AutomationEntity(BaseAutomationEntity, RestoreEntity):
     """Entity to show status of entity."""
@@ -509,6 +528,8 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         self._blueprint_inputs = blueprint_inputs
         self._trace_config = trace_config
         self._attr_unique_id = automation_id
+        self._suspended_until: datetime | None = None
+        self._async_unsub_suspend: CALLBACK_TYPE | None = None
 
     @property
     @override
@@ -521,6 +542,10 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
             AutomationEntityStateAttribute.MODE: self.action_script.script_mode,
             AutomationEntityStateAttribute.CUR: self.action_script.runs,
         }
+        if self._suspended_until is not None:
+            attrs[AutomationEntityStateAttribute.SUSPENDED_UNTIL] = (
+                self._suspended_until.isoformat()
+            )
         if self.action_script.supports_max:
             attrs[AutomationEntityStateAttribute.MAX] = self.action_script.max_runs
         return attrs
@@ -633,6 +658,24 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
             )
             if last_triggered is not None:
                 self.action_script.last_triggered = parse_datetime(last_triggered)
+            if suspended_until_str := state.attributes.get(
+                AutomationEntityStateAttribute.SUSPENDED_UNTIL
+            ):
+                if (suspended_until := parse_datetime(suspended_until_str)) is not None:
+                    utc_suspended_until = dt_util.as_utc(suspended_until)
+                    if utc_suspended_until > dt_util.utcnow():
+                        self._suspended_until = utc_suspended_until
+                        enable_automation = False
+                        self._async_unsub_suspend = async_track_point_in_utc_time(
+                            self.hass,
+                            partial(
+                                self._async_suspended_timer_finished,
+                                expected_until=utc_suspended_until,
+                            ),
+                            utc_suspended_until,
+                        )
+                    else:
+                        enable_automation = True
             self._logger.debug(
                 "Loaded automation %s with state %s from state storage last state %s",
                 self.entity_id,
@@ -648,25 +691,77 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
             )
 
         if self._initial_state is not None:
-            enable_automation = self._initial_state
-            self._logger.debug(
-                "Automation %s initial state %s overridden from config initial_state",
-                self.entity_id,
-                enable_automation,
-            )
+            if self._suspended_until is not None:
+                self._logger.debug(
+                    "Automation %s initial_state %s ignored because it is suspended until %s",
+                    self.entity_id,
+                    self._initial_state,
+                    self._suspended_until,
+                )
+            else:
+                enable_automation = self._initial_state
+                self._logger.debug(
+                    "Automation %s initial state %s overridden from config initial_state",
+                    self.entity_id,
+                    enable_automation,
+                )
 
         if enable_automation:
             await self._async_enable()
 
+    @callback
+    def _clear_suspend_timer(self) -> None:
+        """Clear active suspend timer and reset suspended_until."""
+        if self._async_unsub_suspend is not None:
+            self._async_unsub_suspend()
+            self._async_unsub_suspend = None
+        self._suspended_until = None
+
+    async def _async_suspended_timer_finished(
+        self, now: datetime, expected_until: datetime
+    ) -> None:
+        """Handle suspend timer expiring."""
+        if self._suspended_until != expected_until:
+            return
+        self._clear_suspend_timer()
+        await self._async_enable()
+        self.async_write_ha_state()
+
+    @override
+    async def async_suspend(self, until: datetime | None = None) -> None:
+        """Suspend the automation until a specific datetime or resume if None."""
+        self._clear_suspend_timer()
+        if until is not None:
+            utc_until = dt_util.as_utc(until)
+            if utc_until > dt_util.utcnow():
+                self._suspended_until = utc_until
+                self._async_unsub_suspend = async_track_point_in_utc_time(
+                    self.hass,
+                    partial(
+                        self._async_suspended_timer_finished,
+                        expected_until=utc_until,
+                    ),
+                    utc_until,
+                )
+                await self._async_disable()
+                self.async_write_ha_state()
+                return
+
+        # If until is None or in the past, re-enable
+        await self._async_enable()
+        self.async_write_ha_state()
+
     @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on and update the state."""
+        self._clear_suspend_timer()
         await self._async_enable()
         self.async_write_ha_state()
 
     @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
+        self._clear_suspend_timer()
         if CONF_STOP_ACTIONS in kwargs:
             await self._async_disable(kwargs[CONF_STOP_ACTIONS])
         else:
@@ -820,6 +915,7 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
     @override
     async def async_will_remove_from_hass(self) -> None:
         """Remove listeners when removing automation from Home Assistant."""
+        self._clear_suspend_timer()
         await super().async_will_remove_from_hass()
         if self.registry_entry and self.registry_entry.entity_id != self.entity_id:
             # Entity ID change, do not unload the script or conditions as they will

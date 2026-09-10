@@ -30,6 +30,9 @@
             "restart": "Restart",
             "single": "Single"
           }
+        },
+        "suspended_until": {
+          "name": "Suspended until"
         }
       }
     }
@@ -71,6 +74,16 @@
     "reload": {
       "description": "Reloads the automation configuration.",
       "name": "Reload automations"
+    },
+    "suspend": {
+      "description": "Suspends an automation for a duration or until a specified time.",
+      "fields": {
+        "until": {
+          "description": "The date and time until which the automation should be suspended.",
+          "name": "Until"
+        }
+      },
+      "name": "Suspend automation"
     },
     "toggle": {
       "description": "Toggles (enable / disable) an automation.",
