@@ -2,14 +2,14 @@
 
 from typing import Any, override
 
-from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN
+from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN, async_delete_script
 from homeassistant.components.script.config import (  # pylint: disable=home-assistant-component-root-import
     async_validate_config_item,
 )
 from homeassistant.config import SCRIPT_CONFIG_PATH
 from homeassistant.const import SERVICE_RELOAD
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers import config_validation as cv
 
 from .const import ACTION_DELETE
 from .view import EditKeyBasedConfigView
@@ -25,16 +25,7 @@ def async_setup(hass: HomeAssistant) -> bool:
             await hass.services.async_call(SCRIPT_DOMAIN, SERVICE_RELOAD)
             return
 
-        ent_reg = er.async_get(hass)
-
-        entity_id = ent_reg.async_get_entity_id(
-            SCRIPT_DOMAIN, SCRIPT_DOMAIN, config_key
-        )
-
-        if entity_id is None:
-            return
-
-        ent_reg.async_remove(entity_id)
+        await async_delete_script(hass, script_key=config_key)
 
     hass.http.register_view(
         EditScriptConfigView(

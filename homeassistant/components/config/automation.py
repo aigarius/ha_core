@@ -3,14 +3,17 @@
 from typing import Any, override
 import uuid
 
-from homeassistant.components.automation import DOMAIN as AUTOMATION_DOMAIN
+from homeassistant.components.automation import (
+    DOMAIN as AUTOMATION_DOMAIN,
+    async_delete_automation,
+)
 from homeassistant.components.automation.config import (  # pylint: disable=home-assistant-component-root-import
     async_validate_config_item,
 )
 from homeassistant.config import AUTOMATION_CONFIG_PATH
 from homeassistant.const import CONF_ID, SERVICE_RELOAD
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers import config_validation as cv
 
 from .const import ACTION_DELETE
 from .view import EditIdBasedConfigView
@@ -28,16 +31,7 @@ def async_setup(hass: HomeAssistant) -> bool:
             )
             return
 
-        ent_reg = er.async_get(hass)
-
-        entity_id = ent_reg.async_get_entity_id(
-            AUTOMATION_DOMAIN, AUTOMATION_DOMAIN, config_key
-        )
-
-        if entity_id is None:
-            return
-
-        ent_reg.async_remove(entity_id)
+        await async_delete_automation(hass, automation_id=config_key)
 
     hass.http.register_view(
         EditAutomationConfigView(

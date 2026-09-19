@@ -117,11 +117,13 @@ SCRIPT_MODE_PARALLEL = "parallel"
 SCRIPT_MODE_QUEUED = "queued"
 SCRIPT_MODE_RESTART = "restart"
 SCRIPT_MODE_SINGLE = "single"
+SCRIPT_MODE_ONE_SHOT = "one-shot"
 SCRIPT_MODE_CHOICES = [
     SCRIPT_MODE_PARALLEL,
     SCRIPT_MODE_QUEUED,
     SCRIPT_MODE_RESTART,
     SCRIPT_MODE_SINGLE,
+    SCRIPT_MODE_ONE_SHOT,
 ]
 DEFAULT_SCRIPT_MODE = SCRIPT_MODE_SINGLE
 
@@ -1562,6 +1564,8 @@ class Script:
 
         self._runs: list[_ScriptRun] = []
         self.max_runs = max_runs
+        if script_mode == SCRIPT_MODE_ONE_SHOT and max_exceeded == DEFAULT_MAX_EXCEEDED:
+            max_exceeded = "SILENT"
         self._max_exceeded = max_exceeded
         if script_mode == SCRIPT_MODE_QUEUED:
             self._queue_lck = asyncio.Lock()
@@ -1916,7 +1920,7 @@ class Script:
 
         # Prevent spawning new script runs if not allowed by script mode
         if self.is_running:
-            if self.script_mode == SCRIPT_MODE_SINGLE:
+            if self.script_mode in (SCRIPT_MODE_SINGLE, SCRIPT_MODE_ONE_SHOT):
                 if self._max_exceeded != "SILENT":
                     self._log("Already running", level=LOGSEVERITY[self._max_exceeded])
                 script_execution_set("failed_single")

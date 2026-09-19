@@ -5,6 +5,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any, cast, override
 
 import probatio
@@ -12,6 +13,7 @@ from propcache.api import cached_property
 
 from homeassistant.components import websocket_api
 from homeassistant.components.blueprint import CONF_USE_BLUEPRINT
+from homeassistant.config import AUTOMATION_CONFIG_PATH
 from homeassistant.const import (  # noqa: F401
     ATTR_AREA_ID,
     ATTR_ENTITY_ID,
@@ -47,6 +49,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceNotFound, Templa
 from homeassistant.helpers import (
     condition as condition_helper,
     config_validation as cv,
+    entity_registry as er,
     trigger as trigger_helper,
 )
 from homeassistant.helpers.entity import ToggleEntity
@@ -62,6 +65,8 @@ from homeassistant.helpers.script import (  # noqa: F401
     ATTR_MAX,
     CONF_MAX,
     CONF_MAX_EXCEEDED,
+    SCRIPT_MODE_ONE_SHOT,
+    SCRIPT_MODE_SINGLE,
     Script,
     ScriptRunResult,
     script_stack_cv,
@@ -73,6 +78,7 @@ from homeassistant.helpers.service import (
 )
 from homeassistant.helpers.trace import (
     TraceElement,
+    script_execution_get,
     script_execution_set,
     trace_append_element,
     trace_get,
@@ -80,7 +86,9 @@ from homeassistant.helpers.trace import (
 )
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util.dt import parse_datetime
+from homeassistant.util.file import write_utf8_file_atomic
 from homeassistant.util.hass_dict import HassKey
+from homeassistant.util.yaml import dump, load_yaml
 
 from .config import AutomationConfig, ValidationStatus
 from .const import (
@@ -98,6 +106,61 @@ from .trace import trace_automation
 
 DATA_COMPONENT: HassKey[EntityComponent[BaseAutomationEntity]] = HassKey(DOMAIN)
 ENTITY_ID_FORMAT = DOMAIN + ".{}"
+
+
+def _read_config(path: str) -> list[dict[str, Any]]:
+    """Read YAML config."""
+    if not os.path.isfile(path):
+        return []
+    data = load_yaml(path)
+    return data if isinstance(data, list) else []
+
+
+def _write_config(path: str, data: list[dict[str, Any]]) -> None:
+    """Write YAML config."""
+    contents = dump(data)
+    write_utf8_file_atomic(path, contents)
+
+
+def _delete_from_config(path: str, automation_id: str) -> bool:
+    """Delete automation from config file."""
+    data = _read_config(path)
+    index = next(
+        (idx for idx, val in enumerate(data) if val.get(CONF_ID) == automation_id),
+        None,
+    )
+    if index is None:
+        return False
+    data.pop(index)
+    _write_config(path, data)
+    return True
+
+
+async def async_delete_automation(
+    hass: HomeAssistant, automation_id: str | None, entity_id: str | None = None
+) -> bool:
+    """Delete an automation from config, registry, and state."""
+    deleted = False
+    if automation_id:
+        path = hass.config.path(AUTOMATION_CONFIG_PATH)
+        deleted = await hass.async_add_executor_job(
+            _delete_from_config, path, automation_id
+        )
+
+    ent_reg = er.async_get(hass)
+    if entity_id is None and automation_id:
+        entity_id = ent_reg.async_get_entity_id(DOMAIN, DOMAIN, automation_id)
+
+    if entity_id and entity_id in ent_reg.entities:
+        ent_reg.async_remove(entity_id)
+
+    if entity_id:
+        if (component := hass.data.get(DATA_COMPONENT)) and (
+            entity := component.get_entity(entity_id)
+        ):
+            await entity.async_remove(force_remove=True)
+
+    return deleted
 
 
 CONF_SKIP_CONDITION = "skip_condition"
@@ -496,6 +559,7 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         raw_config: ConfigType | None,
         blueprint_inputs: ConfigType | None,
         trace_config: ConfigType,
+        mode: str = SCRIPT_MODE_SINGLE,
     ) -> None:
         """Initialize an automation entity."""
         self._attr_name = name
@@ -513,6 +577,7 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         self._blueprint_inputs = blueprint_inputs
         self._trace_config = trace_config
         self._attr_unique_id = automation_id
+        self._mode = mode
 
     @property
     @override
@@ -522,7 +587,7 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
             AutomationEntityStateAttribute.LAST_TRIGGERED: (
                 self.action_script.last_triggered
             ),
-            AutomationEntityStateAttribute.MODE: self.action_script.script_mode,
+            AutomationEntityStateAttribute.MODE: self._mode,
             AutomationEntityStateAttribute.CUR: self.action_script.runs,
         }
         if self.action_script.supports_max:
@@ -701,6 +766,9 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         parent_id = None if context is None else context.id
         trigger_context = Context(parent_id=parent_id)
 
+        should_delete = False
+        result: ScriptRunResult | None = None
+
         with trace_automation(
             self.hass,
             self.unique_id,
@@ -786,7 +854,7 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
 
             try:
                 with trace_path("action"):
-                    return await self.action_script.async_run(
+                    result = await self.action_script.async_run(
                         variables, trigger_context, started_action
                     )
             except ServiceNotFound as err:
@@ -819,7 +887,21 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
                 )
                 automation_trace.set_error(err)
 
-            return None
+            if (
+                self._mode == SCRIPT_MODE_ONE_SHOT
+                and result is not None
+                and script_execution_get() == "finished"
+            ):
+                should_delete = True
+
+        if should_delete:
+            await self.async_delete()
+
+        return result
+
+    async def async_delete(self) -> None:
+        """Delete the automation from config, registry, and state."""
+        await async_delete_automation(self.hass, self.unique_id, self.entity_id)
 
     @override
     async def async_will_remove_from_hass(self) -> None:
@@ -1102,6 +1184,7 @@ async def _create_automation_entities(
             automation_config.raw_config,
             automation_config.raw_blueprint_inputs,
             config_block[CONF_TRACE],
+            mode=config_block[CONF_MODE],
         )
         entities.append(entity)
 

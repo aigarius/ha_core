@@ -5300,6 +5300,55 @@ async def test_script_mode_single(
         assert events[1].data["value"] == 2
 
 
+async def test_script_mode_one_shot(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test overlapping runs with script_mode = 'one-shot'."""
+    event = "test_event"
+    events = async_capture_events(hass, event)
+    sequence = cv.SCRIPT_SCHEMA(
+        [
+            {"event": event, "event_data": {"value": 1}},
+            {"wait_template": "{{ states.switch.test.state == 'off' }}"},
+            {"event": event, "event_data": {"value": 2}},
+        ]
+    )
+    script_obj = script.Script(
+        hass,
+        sequence,
+        "Test Name",
+        "test_domain",
+        script_mode=script.SCRIPT_MODE_ONE_SHOT,
+    )
+    wait_started_flag = async_watch_for_action(script_obj, "wait")
+
+    try:
+        hass.states.async_set("switch.test", "on")
+        hass.async_create_task(script_obj.async_run(context=Context()))
+        await asyncio.wait_for(wait_started_flag.wait(), 1)
+
+        assert script_obj.is_running
+        assert len(events) == 1
+        assert events[0].data["value"] == 1
+
+        # Start second run of script while first run is suspended in wait_template.
+        await script_obj.async_run(context=Context())
+
+        # By default max_exceeded for one-shot is SILENT, so "Already running" is not logged.
+        assert "Already running" not in caplog.text
+        assert script_obj.is_running
+    except AssertionError, TimeoutError:
+        await script_obj.async_stop()
+        raise
+    else:
+        hass.states.async_set("switch.test", "off")
+        await hass.async_block_till_done()
+
+        assert not script_obj.is_running
+        assert len(events) == 2
+        assert events[1].data["value"] == 2
+
+
 @pytest.mark.parametrize("max_exceeded", [None, "WARNING", "INFO", "ERROR", "SILENT"])
 @pytest.mark.parametrize(
     ("script_mode", "max_runs"), [("single", 1), ("parallel", 2), ("queued", 2)]

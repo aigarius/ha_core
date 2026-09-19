@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import ANY, Mock, patch
 
@@ -29,11 +30,12 @@ from homeassistant.core import (
     callback,
     split_entity_id,
 )
-from homeassistant.exceptions import ServiceNotFound, TemplateError
+from homeassistant.exceptions import HomeAssistantError, ServiceNotFound, TemplateError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.event import async_track_state_change
 from homeassistant.helpers.script import (
     SCRIPT_MODE_CHOICES,
+    SCRIPT_MODE_ONE_SHOT,
     SCRIPT_MODE_PARALLEL,
     SCRIPT_MODE_QUEUED,
     SCRIPT_MODE_RESTART,
@@ -1345,6 +1347,7 @@ async def test_script_restore_last_triggered(hass: HomeAssistant) -> None:
         (SCRIPT_MODE_QUEUED, "Disallowed recursion detected"),
         (SCRIPT_MODE_RESTART, "Disallowed recursion detected"),
         (SCRIPT_MODE_SINGLE, "Already running"),
+        (SCRIPT_MODE_ONE_SHOT, None),
     ],
 )
 async def test_recursive_script(
@@ -1357,6 +1360,7 @@ async def test_recursive_script(
         SCRIPT_MODE_QUEUED,
         SCRIPT_MODE_RESTART,
         SCRIPT_MODE_SINGLE,
+        SCRIPT_MODE_ONE_SHOT,
     ] == SCRIPT_MODE_CHOICES
 
     assert await async_setup_component(
@@ -1385,7 +1389,10 @@ async def test_recursive_script(
     await hass.services.async_call(DOMAIN, "script1")
     await asyncio.wait_for(service_called.wait(), 1)
 
-    assert warning_msg in caplog.text
+    if warning_msg:
+        assert warning_msg in caplog.text
+    else:
+        assert "Already running" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1395,6 +1402,7 @@ async def test_recursive_script(
         (SCRIPT_MODE_QUEUED, "Disallowed recursion detected"),
         (SCRIPT_MODE_RESTART, "Disallowed recursion detected"),
         (SCRIPT_MODE_SINGLE, "Already running"),
+        (SCRIPT_MODE_ONE_SHOT, None),
     ],
 )
 async def test_recursive_script_indirect(
@@ -1407,6 +1415,7 @@ async def test_recursive_script_indirect(
         SCRIPT_MODE_QUEUED,
         SCRIPT_MODE_RESTART,
         SCRIPT_MODE_SINGLE,
+        SCRIPT_MODE_ONE_SHOT,
     ] == SCRIPT_MODE_CHOICES
 
     assert await async_setup_component(
@@ -1453,7 +1462,10 @@ async def test_recursive_script_indirect(
     await hass.services.async_call(DOMAIN, "script1")
     await asyncio.wait_for(service_called.wait(), 1)
 
-    assert warning_msg in caplog.text
+    if warning_msg:
+        assert warning_msg in caplog.text
+    else:
+        assert "Already running" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1475,6 +1487,7 @@ async def test_recursive_script_turn_on(
         SCRIPT_MODE_QUEUED,
         SCRIPT_MODE_RESTART,
         SCRIPT_MODE_SINGLE,
+        SCRIPT_MODE_ONE_SHOT,
     ] == SCRIPT_MODE_CHOICES
     stop_scripts_at_shutdown_called = asyncio.Event()
     real_stop_scripts_at_shutdown = _async_stop_scripts_at_shutdown
@@ -1992,3 +2005,142 @@ async def test_remove_script_entity_unloads_script(hass: HomeAssistant) -> None:
         await hass.async_block_till_done()
 
     script_unload.assert_called_once()
+
+
+async def test_one_shot_script(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test one-shot script successfully completes and deletes itself."""
+    calls = async_mock_service(hass, "test", "script")
+
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "one_shot_script": {
+                    "mode": "one-shot",
+                    "sequence": [{"action": "test.script"}],
+                }
+            }
+        },
+    )
+
+    state = hass.states.get("script.one_shot_script")
+    assert state is not None
+    assert state.attributes["mode"] == "one-shot"
+    assert entity_registry.async_get("script.one_shot_script") is not None
+
+    await hass.services.async_call(DOMAIN, "one_shot_script", blocking=True)
+
+    assert len(calls) == 1
+    assert hass.states.get("script.one_shot_script") is None
+    assert entity_registry.async_get("script.one_shot_script") is None
+
+
+async def test_one_shot_script_with_config_file(
+    hass: HomeAssistant,
+    tmp_path: Path,
+) -> None:
+    """Test one-shot script deletes itself from scripts.yaml."""
+    calls = async_mock_service(hass, "test", "script")
+    scripts_file = tmp_path / "scripts.yaml"
+    orig_data = {
+        "one_shot_1": {
+            "mode": "one-shot",
+            "sequence": [{"action": "test.script"}],
+        },
+        "regular_1": {
+            "mode": "single",
+            "sequence": [{"action": "test.script"}],
+        },
+    }
+    scripts_file.write_text(yaml_util.dump(orig_data), encoding="utf-8")
+
+    with patch.object(hass.config, "path", return_value=str(scripts_file)):
+        assert await async_setup_component(
+            hass,
+            DOMAIN,
+            {DOMAIN: orig_data},
+        )
+
+        state = hass.states.get("script.one_shot_1")
+        assert state is not None
+
+        await hass.services.async_call(DOMAIN, "one_shot_1", blocking=True)
+
+        assert len(calls) == 1
+        assert hass.states.get("script.one_shot_1") is None
+        assert hass.states.get("script.regular_1") is not None
+
+        updated_data = yaml_util.load_yaml(str(scripts_file))
+        assert "one_shot_1" not in updated_data
+        assert "regular_1" in updated_data
+
+
+async def test_one_shot_script_action_error(
+    hass: HomeAssistant,
+) -> None:
+    """Test one-shot script is not deleted if an action fails."""
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "error_script": {
+                    "mode": "one-shot",
+                    "sequence": [{"action": "test.script"}],
+                }
+            }
+        },
+    )
+
+    state = hass.states.get("script.error_script")
+    assert state is not None
+
+    with (
+        patch(
+            "homeassistant.helpers.script.Script.async_run",
+            side_effect=HomeAssistantError("boom"),
+        ),
+        pytest.raises(HomeAssistantError),
+    ):
+        await hass.services.async_call(DOMAIN, "error_script", blocking=True)
+
+    assert hass.states.get("script.error_script") is not None
+
+
+async def test_one_shot_script_concurrent_calls(
+    hass: HomeAssistant,
+) -> None:
+    """Test one-shot script behaves like single mode with silent max_exceeded when called while running."""
+    calls = async_mock_service(hass, "test", "script")
+
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "concurrent_script": {
+                    "mode": "one-shot",
+                    "sequence": [
+                        {"action": "test.script"},
+                        {"delay": {"seconds": 0.05}},
+                    ],
+                }
+            }
+        },
+    )
+
+    task1 = asyncio.create_task(
+        hass.services.async_call(DOMAIN, "concurrent_script", blocking=True)
+    )
+    await asyncio.sleep(0.01)
+    task2 = asyncio.create_task(
+        hass.services.async_call(DOMAIN, "concurrent_script", blocking=True)
+    )
+    await asyncio.gather(task1, task2)
+
+    assert len(calls) == 1
+    assert hass.states.get("script.concurrent_script") is None

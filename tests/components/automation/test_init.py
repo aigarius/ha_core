@@ -3,6 +3,7 @@
 import asyncio
 from datetime import timedelta
 import logging
+from pathlib import Path
 from typing import Any
 from unittest.mock import ANY, Mock, patch
 
@@ -51,6 +52,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.script import (
     SCRIPT_MODE_CHOICES,
+    SCRIPT_MODE_ONE_SHOT,
     SCRIPT_MODE_PARALLEL,
     SCRIPT_MODE_QUEUED,
     SCRIPT_MODE_RESTART,
@@ -3524,6 +3526,7 @@ async def test_trigger_condition_explicit_id(
         (SCRIPT_MODE_QUEUED, 2),
         (SCRIPT_MODE_RESTART, 2),
         (SCRIPT_MODE_SINGLE, 1),
+        (SCRIPT_MODE_ONE_SHOT, 1),
     ],
 )
 @pytest.mark.parametrize(
@@ -3533,6 +3536,7 @@ async def test_trigger_condition_explicit_id(
         (SCRIPT_MODE_QUEUED, "script1: Disallowed recursion detected"),
         (SCRIPT_MODE_RESTART, "script1: Disallowed recursion detected"),
         (SCRIPT_MODE_SINGLE, "script1: Already running"),
+        (SCRIPT_MODE_ONE_SHOT, None),
     ],
 )
 @pytest.mark.parametrize("wait_for_stop_scripts_after_shutdown", [True])
@@ -3553,6 +3557,7 @@ async def test_recursive_automation_starting_script(
         SCRIPT_MODE_QUEUED,
         SCRIPT_MODE_RESTART,
         SCRIPT_MODE_SINGLE,
+        SCRIPT_MODE_ONE_SHOT,
     ] == SCRIPT_MODE_CHOICES
 
     stop_scripts_at_shutdown_called = asyncio.Event()
@@ -3644,7 +3649,10 @@ async def test_recursive_automation_starting_script(
         async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=60))
         await hass.async_block_till_done()
 
-        assert script_warning_msg in caplog.text
+        if script_warning_msg:
+            assert script_warning_msg in caplog.text
+        else:
+            assert "script1: Already running" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -4531,3 +4539,177 @@ async def test_not_triggered_trace_isolated_from_chained_run(
     child_trace = await _get_only_trace("child")
     assert child_trace["not_triggered"] is True
     assert set(child_trace["trace"]) == {"trigger/0"}
+
+
+async def test_one_shot_automation(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test one-shot automation successfully completes and deletes itself."""
+    calls = async_mock_service(hass, "test", "automation")
+
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "id": "my_one_shot_id",
+                "alias": "My One Shot",
+                "mode": "one-shot",
+                "trigger": {"trigger": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation"},
+            }
+        },
+    )
+
+    state = hass.states.get("automation.my_one_shot")
+    assert state is not None
+    assert state.attributes["mode"] == "one-shot"
+    assert entity_registry.async_get("automation.my_one_shot") is not None
+
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    assert hass.states.get("automation.my_one_shot") is None
+    assert entity_registry.async_get("automation.my_one_shot") is None
+
+
+async def test_one_shot_automation_with_config_file(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    tmp_path: Path,
+) -> None:
+    """Test one-shot automation deletes itself from automations.yaml."""
+    calls = async_mock_service(hass, "test", "automation")
+    automations_file = tmp_path / "automations.yaml"
+    orig_data = [
+        {
+            "id": "one_shot_1",
+            "alias": "One Shot 1",
+            "mode": "one-shot",
+            "trigger": [{"trigger": "event", "event_type": "test_event"}],
+            "action": [{"action": "test.automation"}],
+        },
+        {
+            "id": "regular_1",
+            "alias": "Regular 1",
+            "mode": "single",
+            "trigger": [{"trigger": "event", "event_type": "other_event"}],
+            "action": [{"action": "test.automation"}],
+        },
+    ]
+    automations_file.write_text(yaml_util.dump(orig_data), encoding="utf-8")
+
+    with patch.object(hass.config, "path", return_value=str(automations_file)):
+        assert await async_setup_component(
+            hass,
+            DOMAIN,
+            {
+                DOMAIN: orig_data,
+            },
+        )
+
+        state = hass.states.get("automation.one_shot_1")
+        assert state is not None
+
+        hass.bus.async_fire("test_event")
+        await hass.async_block_till_done()
+
+        assert len(calls) == 1
+        assert hass.states.get("automation.one_shot_1") is None
+        assert hass.states.get("automation.regular_1") is not None
+
+        updated_data = yaml_util.load_yaml(str(automations_file))
+        assert len(updated_data) == 1
+        assert updated_data[0]["id"] == "regular_1"
+
+
+async def test_one_shot_automation_condition_failure(
+    hass: HomeAssistant,
+) -> None:
+    """Test one-shot automation is not deleted if conditions fail."""
+    calls = async_mock_service(hass, "test", "automation")
+
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "alias": "Condition Fail",
+                "mode": "one-shot",
+                "trigger": {"trigger": "event", "event_type": "test_event"},
+                "condition": {"condition": "template", "value_template": "{{ false }}"},
+                "action": {"action": "test.automation"},
+            }
+        },
+    )
+
+    state = hass.states.get("automation.condition_fail")
+    assert state is not None
+
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+
+    assert len(calls) == 0
+    assert hass.states.get("automation.condition_fail") is not None
+
+
+async def test_one_shot_automation_action_error(
+    hass: HomeAssistant,
+) -> None:
+    """Test one-shot automation is not deleted if actions raise an error."""
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "alias": "Action Error",
+                "mode": "one-shot",
+                "trigger": {"trigger": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation"},
+            }
+        },
+    )
+
+    state = hass.states.get("automation.action_error")
+    assert state is not None
+
+    with patch(
+        "homeassistant.helpers.script.Script.async_run",
+        side_effect=HomeAssistantError("boom"),
+    ):
+        hass.bus.async_fire("test_event")
+        await hass.async_block_till_done()
+
+    assert hass.states.get("automation.action_error") is not None
+
+
+async def test_one_shot_automation_concurrent_runs(
+    hass: HomeAssistant,
+) -> None:
+    """Test one-shot automation behaves like single mode with silent max_exceeded when triggered while running."""
+    calls = async_mock_service(hass, "test", "automation")
+
+    assert await async_setup_component(
+        hass,
+        DOMAIN,
+        {
+            DOMAIN: {
+                "alias": "Concurrent One Shot",
+                "mode": "one-shot",
+                "trigger": {"trigger": "event", "event_type": "test_event"},
+                "action": [
+                    {"action": "test.automation"},
+                    {"delay": {"seconds": 0.05}},
+                ],
+            }
+        },
+    )
+
+    hass.bus.async_fire("test_event")
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+
+    assert len(calls) == 1
+    assert hass.states.get("automation.concurrent_one_shot") is None

@@ -3,8 +3,11 @@
 from enum import StrEnum
 import logging
 
+from homeassistant.helpers.script import SCRIPT_MODE_ONE_SHOT
+
 CONF_TRIGGER_VARIABLES = "trigger_variables"
 DOMAIN = "automation"
+AUTOMATION_MODE_ONE_SHOT = SCRIPT_MODE_ONE_SHOT
 
 
 class AutomationEntityCapabilityAttribute(StrEnum):

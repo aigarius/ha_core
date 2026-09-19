@@ -25,6 +25,7 @@
         "mode": {
           "name": "Run mode",
           "state": {
+            "one-shot": "One-shot",
             "parallel": "Parallel",
             "queued": "Queued",
             "restart": "Restart",

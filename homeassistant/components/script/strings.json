@@ -25,6 +25,7 @@
         "mode": {
           "name": "[%key:component::automation::entity_component::_::state_attributes::mode::name%]",
           "state": {
+            "one-shot": "[%key:component::automation::entity_component::_::state_attributes::mode::state::one-shot%]",
             "parallel": "[%key:component::automation::entity_component::_::state_attributes::mode::state::parallel%]",
             "queued": "[%key:component::automation::entity_component::_::state_attributes::mode::state::queued%]",
             "restart": "[%key:component::automation::entity_component::_::state_attributes::mode::state::restart%]",

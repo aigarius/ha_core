@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import asyncio
 from dataclasses import dataclass
 import logging
+import os
 from typing import TYPE_CHECKING, Any, cast, override
 
 import probatio
@@ -11,6 +12,7 @@ from propcache.api import cached_property
 
 from homeassistant.components import websocket_api
 from homeassistant.components.blueprint import CONF_USE_BLUEPRINT
+from homeassistant.config import SCRIPT_CONFIG_PATH
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_MODE,
@@ -37,7 +39,7 @@ from homeassistant.core import (
     SupportsResponse,
     callback,
 )
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.config_validation import make_entity_service_schema
 from homeassistant.helpers.entity import ToggleEntity
 from homeassistant.helpers.entity_component import EntityComponent
@@ -52,15 +54,18 @@ from homeassistant.helpers.script import (
     ATTR_MAX,
     CONF_MAX,
     CONF_MAX_EXCEEDED,
+    SCRIPT_MODE_ONE_SHOT,
     Script,
     ScriptRunResult,
     script_stack_cv,
 )
 from homeassistant.helpers.service import async_set_service_schema
-from homeassistant.helpers.trace import trace_get, trace_path
+from homeassistant.helpers.trace import script_execution_get, trace_get, trace_path
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util.async_ import create_eager_task
 from homeassistant.util.dt import parse_datetime
+from homeassistant.util.file import write_utf8_file_atomic
+from homeassistant.util.yaml import dump, load_yaml
 
 from .config import ScriptConfig, ValidationStatus
 from .const import (
@@ -82,6 +87,57 @@ SCRIPT_TURN_ONOFF_SCHEMA = make_entity_service_schema(
     {probatio.Optional(ATTR_VARIABLES): {str: cv.match_all}}
 )
 RELOAD_SERVICE_SCHEMA = probatio.Schema({})
+
+
+def _read_config(path: str) -> dict[str, dict[str, Any]]:
+    """Read YAML config."""
+    if not os.path.isfile(path):
+        return {}
+    data = load_yaml(path)
+    return data if isinstance(data, dict) else {}
+
+
+def _write_config(path: str, data: dict[str, dict[str, Any]]) -> None:
+    """Write YAML config."""
+    contents = dump(data)
+    write_utf8_file_atomic(path, contents)
+
+
+def _delete_from_config(path: str, script_key: str) -> bool:
+    """Delete script from config file."""
+    data = _read_config(path)
+    if script_key not in data:
+        return False
+    data.pop(script_key)
+    _write_config(path, data)
+    return True
+
+
+async def async_delete_script(
+    hass: HomeAssistant, script_key: str | None, entity_id: str | None = None
+) -> bool:
+    """Delete a script from config, registry, and state."""
+    deleted = False
+    if script_key:
+        path = hass.config.path(SCRIPT_CONFIG_PATH)
+        deleted = await hass.async_add_executor_job(
+            _delete_from_config, path, script_key
+        )
+
+    ent_reg = er.async_get(hass)
+    if entity_id is None and script_key:
+        entity_id = ent_reg.async_get_entity_id(DOMAIN, DOMAIN, script_key)
+
+    if entity_id and entity_id in ent_reg.entities:
+        ent_reg.async_remove(entity_id)
+
+    if entity_id:
+        if (component := hass.data.get(DOMAIN)) and (
+            entity := component.get_entity(entity_id)
+        ):
+            await entity.async_remove(force_remove=True)
+
+    return deleted
 
 
 def is_on(hass: HomeAssistant, entity_id: str) -> bool:
@@ -705,6 +761,9 @@ class ScriptEntity(BaseScriptEntity, RestoreEntity):
     async def _async_run(
         self, variables: dict[str, Any] | None, context: Context
     ) -> ScriptRunResult | None:
+        should_delete = False
+        result: ScriptRunResult | None = None
+
         with trace_script(
             self.hass,
             self._attr_unique_id,
@@ -720,7 +779,23 @@ class ScriptEntity(BaseScriptEntity, RestoreEntity):
                 if state := self.hass.states.get(self.entity_id):
                     this = state.as_dict()
                 script_vars = {"this": this, **(variables or {})}
-                return await self.script.async_run(script_vars, context)
+                result = await self.script.async_run(script_vars, context)
+
+            if (
+                self.script.script_mode == SCRIPT_MODE_ONE_SHOT
+                and result is not None
+                and script_execution_get() == "finished"
+            ):
+                should_delete = True
+
+        if should_delete:
+            await self.async_delete()
+
+        return result
+
+    async def async_delete(self) -> None:
+        """Delete the script from config, registry, and state."""
+        await async_delete_script(self.hass, self._attr_unique_id, self.entity_id)
 
     @override
     async def async_turn_off(self, **kwargs: Any) -> None:
